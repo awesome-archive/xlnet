@@ -3,6 +3,7 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
+import os
 import re
 import numpy as np
 import six
@@ -121,19 +122,21 @@ def get_train_op(FLAGS, total_loss, grads_and_vars=None):
   learning_rate = tf.where(global_step < FLAGS.warmup_steps,
                            warmup_lr, decay_lr)
 
+  if (FLAGS.weight_decay > 0 and not FLAGS.use_tpu and
+      FLAGS.num_core_per_host > 1):
+    raise ValueError("Do not support `weight_decay > 0` with multi-gpu "
+                     "training so far.")
+
   if FLAGS.weight_decay == 0:
     optimizer = tf.train.AdamOptimizer(
         learning_rate=learning_rate,
         epsilon=FLAGS.adam_epsilon)
-  elif FLAGS.weight_decay > 0 and FLAGS.num_core_per_host == 1:
+  else:
     optimizer = AdamWeightDecayOptimizer(
         learning_rate=learning_rate,
         epsilon=FLAGS.adam_epsilon,
         exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"],
         weight_decay_rate=FLAGS.weight_decay)
-  else:
-    raise ValueError("Do not support `weight_decay > 0` with multi-gpu "
-                     "training so far.")
 
   if FLAGS.use_tpu:
     optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
@@ -142,11 +145,28 @@ def get_train_op(FLAGS, total_loss, grads_and_vars=None):
     grads_and_vars = optimizer.compute_gradients(total_loss)
   gradients, variables = zip(*grads_and_vars)
   clipped, gnorm = tf.clip_by_global_norm(gradients, FLAGS.clip)
+
+  if getattr(FLAGS, "lr_layer_decay_rate", 1.0) != 1.0:
+    n_layer = 0
+    for i in range(len(clipped)):
+      m = re.search(r"model/transformer/layer_(\d+?)/", variables[i].name)
+      if not m: continue
+      n_layer = max(n_layer, int(m.group(1)) + 1)
+
+    for i in range(len(clipped)):
+      for l in range(n_layer):
+        if "model/transformer/layer_{}/".format(l) in variables[i].name:
+          abs_rate = FLAGS.lr_layer_decay_rate ** (n_layer - 1 - l)
+          clipped[i] *= abs_rate
+          tf.logging.info("Apply mult {:.4f} to layer-{} grad of {}".format(
+              abs_rate, l, variables[i].name))
+          break
+
   train_op = optimizer.apply_gradients(
       zip(clipped, variables), global_step=global_step)
 
   # Manually increment `global_step` for AdamWeightDecayOptimizer
-  if isinstance(optimizer, AdamWeightDecayOptimizer):
+  if FLAGS.weight_decay > 0:
     new_global_step = global_step + 1
     train_op = tf.group(train_op, [global_step.assign(new_global_step)])
 
